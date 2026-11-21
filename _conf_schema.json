@@ -1,0 +1,140 @@
+{
+  "enabled": {
+    "type": "bool",
+    "description": "启用点歌消费积分",
+    "default": true,
+    "hint": "关掉后 /点歌 只回一句「功能未开启」，不扣分也不播放"
+  },
+  "cost_per_song": {
+    "type": "int",
+    "description": "每次点歌消耗积分",
+    "default": 10,
+    "hint": "从签到积分余额里扣，填 0 表示白嫖（只记流水不扣分）"
+  },
+  "free_daily_quota": {
+    "type": "int",
+    "description": "每人每天免费点歌次数",
+    "default": 0,
+    "hint": "默认 0 = 关闭。填 2 表示每天前 2 次免费，第 3 次开始扣分；按群+人+自然日计算"
+  },
+  "admin_free": {
+    "type": "bool",
+    "description": "管理员点歌免单",
+    "default": false,
+    "hint": "打开后 AstrBot 管理员在本群点歌不扣分（仍会记流水）"
+  },
+  "music_backend": {
+    "type": "string",
+    "description": "播放后端",
+    "default": "llm_tool",
+    "hint": "llm_tool = 调用已注册的音乐插件工具真播放（推荐）；none = 只扣分记账不播放"
+  },
+  "music_tool_name": {
+    "type": "string",
+    "description": "音乐播放工具名",
+    "default": "play_song_by_name",
+    "hint": "本插件会在已注册的 LLM 工具里找这个名字，找到就按它声明的参数名喂参（song_name/artist/platform/send_mode）"
+  },
+  "music_default_platform": {
+    "type": "string",
+    "description": "默认音源（可空）",
+    "default": "",
+    "hint": "只有当音乐工具声明了 platform 参数时才会传，例如 netease / qqmusic / kugou；留空则不指定"
+  },
+  "music_send_mode": {
+    "type": "string",
+    "description": "默认发送方式（可空）",
+    "default": "",
+    "hint": "只有当音乐工具声明了 send_mode 参数时才会传，例如 voice / card / record_link；留空用音乐插件自己的默认"
+  },
+  "music_timeout": {
+    "type": "int",
+    "description": "播放超时秒数",
+    "default": 45,
+    "hint": "超时会把这次扣的积分自动退回"
+  },
+  "refund_on_failure": {
+    "type": "bool",
+    "description": "播放失败自动退分",
+    "default": true,
+    "hint": "推荐开着：先扣分再播放，播放抛异常就原路退回，避免「扣了分没歌」"
+  },
+  "at_mention_enabled": {
+    "type": "bool",
+    "description": "支持「@机器人 + 歌名」点歌",
+    "default": false,
+    "hint": "默认关。打开后凡是 @机器人 且内容是歌名的消息都会被当作点歌（群里会比较容易误触）"
+  },
+  "allow_private": {
+    "type": "bool",
+    "description": "允许私聊点歌",
+    "default": false,
+    "hint": "私聊的积分口径是 private:<QQ号>，与签到插件一致（签到插件也要开 allow_private 才有分）"
+  },
+  "allowed_groups": {
+    "type": "list",
+    "description": "只在这些群生效（留空 = 全部群）",
+    "default": [],
+    "hint": "填群号字符串，例如 [\"123456789\"]；非空时其他群一律拦截"
+  },
+  "blocked_groups": {
+    "type": "list",
+    "description": "这些群禁用点歌",
+    "default": [],
+    "hint": "填群号字符串；优先级高于 allowed_groups"
+  },
+  "dedupe_seconds": {
+    "type": "int",
+    "description": "无消息 ID 时的防重时间窗（秒）",
+    "default": 0,
+    "hint": "正常情况下按平台消息 ID 幂等，无需设置；某些适配器不提供消息 ID 时，填 30 表示同一个人 30 秒内点同一首歌只扣一次"
+  },
+  "leaderboard_size": {
+    "type": "int",
+    "description": "消费榜显示条数",
+    "default": 10,
+    "hint": "1 ~ 50"
+  },
+  "history_size": {
+    "type": "int",
+    "description": "账单显示条数",
+    "default": 5,
+    "hint": "1 ~ 50"
+  },
+  "success_template": {
+    "type": "text",
+    "description": "点歌成功文案模板",
+    "default": "✅ 点歌成功｜{song}｜扣 {cost} 分｜剩余 {balance} 分",
+    "hint": "占位符：{song} {cost} {balance} {name} {free_left}"
+  },
+  "free_template": {
+    "type": "text",
+    "description": "免费次数点歌文案模板",
+    "default": "🎁 今日免费点歌｜{song}｜免费次数剩 {free_left} 次｜余额 {balance} 分",
+    "hint": "占位符同上"
+  },
+  "not_enough_template": {
+    "type": "text",
+    "description": "积分不足文案模板",
+    "default": "⚠️ 积分不够点歌｜「{song}」要 {cost} 分，你现在 {balance} 分｜先发 /签到 攒分吧",
+    "hint": "占位符：{song} {cost} {balance} {lack} {name}"
+  },
+  "timezone": {
+    "type": "string",
+    "description": "时区（每日免费次数按此跨天）",
+    "default": "Asia/Shanghai",
+    "hint": "建议与签到插件保持一致"
+  },
+  "checkin_plugin_name": {
+    "type": "string",
+    "description": "签到插件目录名",
+    "default": "astrbot_plugin_checkin",
+    "hint": "默认即可，除非你把签到插件改名了。本插件通过它定位 checkin.db"
+  },
+  "db_path_override": {
+    "type": "string",
+    "description": "积分库路径（高级，可空）",
+    "default": "",
+    "hint": "留空自动定位 data/plugin_data/astrbot_plugin_checkin/checkin.db；填了就用你给的绝对路径"
+  }
+}

@@ -60,6 +60,7 @@ git clone https://github.com/dian-dian233/astrbot_plugin_song_points.git
 | `music_send_mode` | string | 空 | 默认发送方式（只有工具声明 `send_mode` 时才传） |
 | `music_timeout` | int | `45` | 播放超时秒数，超时自动退分 |
 | `refund_on_failure` | bool | `true` | 播放异常自动退分 |
+| `stale_pending_seconds` | int | `600` | 启动时把卡在 pending 超过这么久（进程崩了）的订单自动退分，0 = 关闭 |
 | `at_mention_enabled` | bool | `false` | 开「@机器人 + 歌名」触发（群里比较易误触，默认关） |
 | `allow_private` | bool | `false` | 允许私聊点歌（签到插件也要开私聊才有分） |
 | `allowed_groups` | list | `[]` | 只在这些群生效，空 = 全部群 |
@@ -163,7 +164,7 @@ cd astrbot_plugin_song_points
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -v
 ```
 
-预期：`Ran 45 tests ... OK`。覆盖：
+预期：`Ran 48 tests ... OK`。覆盖：
 
 - 扣分/余额、积分不足不扣、群隔离、余额 0 用户
 - 幂等（同 key 重复 + 6 线程并发）、退分幂等、免费次数跨天重置与失败归还
@@ -184,12 +185,17 @@ PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -v
 | 一条消息扣两次分 | 音乐插件与本插件都注册了 `/点歌`，两个 handler 都跑 | WebUI → 指令管理里禁用其中一个（会显示冲突）；或用 `/点歌` 别名区分 |
 | 换个群积分不对 | 积分本来就是按群隔离的（与签到一致） | 想让全群共享得等签到插件支持全局余额，本插件不擅自合并 |
 | 私聊点歌没分 | 私聊口径是 `private:<QQ>`，签到插件默认不允许私聊 | 两个插件都开 `allow_private` |
+| 重启后积分少了但没听到歌 | 上次进程崩在「扣完分、还没 mark_played」之间 | v1.0.1 起启动自动退分（`stale_pending_seconds`，默认 600 秒）；手动可用 `/点歌账单` 看到 `已退分` 状态 |
 | `_empty() takes no arguments` 一类的报错 | 指令 handler 里写了 `*args`/`**kwargs` | 本插件不写：歌名自己从 `event.message_str` 剥前缀解析，无需框架转换 |
 
 ---
 
 ## 七、版本记录
 
+- **v1.0.1**
+  - 新增 `stale_pending_seconds`：插件启动时清扫「扣完分但没来得及落 played」的悬空订单并退分
+    （进程崩溃/重启兜底）；退分沿用同一套幂等逻辑，只动 `pending`
+  - 自测 45 → 48 条（+2 清扫用例、+1 启动生命周期用例）
 - **v1.0.0**（首发）
   - `/点歌`、`/点歌账单`、`/点歌榜`、`@机器人` 触发、LLM 工具 `song_with_points` / `song_points_balance`
   - 复用签到积分库，原子扣分 + 幂等防重 + 播放失败退分

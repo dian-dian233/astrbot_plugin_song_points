@@ -379,6 +379,12 @@ class TestAtMention(PluginTestBase):
 
 
 class TestLlmTools(PluginTestBase):
+    def test_initialize_runs_without_error(self) -> None:
+        self.grant(points=30)
+        plugin = self.make_plugin()
+        asyncio.run(plugin.initialize())  # 启动清扫不应炸
+        self.assertEqual(self.points(), 30)
+
     def test_balance_tool(self) -> None:
         self.grant(points=42)
         plugin = self.make_plugin()
@@ -405,7 +411,7 @@ class TestSchemaAndMetadata(unittest.TestCase):
             "enabled", "cost_per_song", "free_daily_quota", "admin_free",
             "music_backend", "music_tool_name", "music_default_platform",
             "music_send_mode", "music_timeout", "refund_on_failure",
-            "at_mention_enabled", "allow_private", "allowed_groups",
+            "stale_pending_seconds", "at_mention_enabled", "allow_private", "allowed_groups",
             "blocked_groups", "dedupe_seconds", "leaderboard_size",
             "history_size", "success_template", "free_template",
             "not_enough_template", "timezone", "checkin_plugin_name",

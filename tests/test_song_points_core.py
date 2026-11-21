@@ -10,6 +10,7 @@ import sqlite3
 import sys
 import tempfile
 import threading
+import time
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -276,6 +277,22 @@ class TestRefundAndRecords(StoreTestBase):
         self.assertEqual(stats.total_orders, 1)
         self.assertEqual(stats.total_spent, 10)
         self.assertEqual(stats.today_orders, 1)
+
+    def test_sweep_stale_pending(self) -> None:
+        self.grant("88888", "10001", 30)
+        store = self.make_store()
+        old = self.order(store, key="old", now_ts=int(time.time()) - 7200)
+        # 正常播放中的订单不该被清掉
+        self.assertEqual(store.sweep_stale_pending(600), 1)
+        self.assertEqual(self.points("88888", "10001"), 30)
+        self.assertFalse(store.refund(old.order_id))
+
+    def test_sweep_keeps_fresh_pending(self) -> None:
+        self.grant("88888", "10001", 30)
+        store = self.make_store()
+        self.order(store, key="fresh")
+        self.assertEqual(store.sweep_stale_pending(600), 0)
+        self.assertEqual(self.points("88888", "10001"), 20)
 
 
 class TestParsing(unittest.TestCase):

@@ -569,5 +569,16 @@ class SongPointsPlugin(Star):
         return f"当前可用积分 {balance} 分，今日免费点歌剩余 {free_left} 次。"
 
     # ------------------------------------------------------------ 生命周期
+    async def initialize(self):
+        """启动时把上次崩在 pending 里的订单退分（只动超过 stale_pending_seconds 的）。"""
+        try:
+            seconds = int(self._cfg("stale_pending_seconds", 600) or 0)
+            if seconds > 0:
+                fixed = await asyncio.to_thread(self.store.sweep_stale_pending, seconds)
+                if fixed:
+                    logger.info("[song_points] 启动清扫：退回 %d 笔悬空扣分", fixed)
+        except Exception as exc:  # 清扫失败不影响插件加载
+            logger.warning("[song_points] 启动清扫失败：%s", exc)
+
     async def terminate(self):
         self._store = None

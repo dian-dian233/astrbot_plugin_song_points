@@ -591,6 +591,27 @@ class SongPointsStore:
             return True
 
     # -------------------------------------------------------- 查询
+    def sweep_stale_pending(self, older_than: int = 600, now_ts: Optional[int] = None) -> int:
+        """把卡在 pending 太久的订单退分（进程崩在「扣完分、还没 mark_played」之间）。
+
+        只动 ts 早于 now-older_than 的 pending，正常播放中的订单不会被打到。
+        """
+        ts = int(now_ts if now_ts is not None else time.time())
+        cutoff = ts - max(0, int(older_than))
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                "SELECT id FROM song_order_log WHERE status=? AND ts <= ?",
+                (STATUS_PENDING, cutoff),
+            ).fetchall()
+        finally:
+            conn.close()
+        fixed = 0
+        for row in rows:
+            if self.refund(int(row["id"]), "auto refund: stale pending", ts):
+                fixed += 1
+        return fixed
+
     def history(self, scope: str, user_id: str, limit: int = 5) -> list[OrderRow]:
         conn = self._connect()
         try:

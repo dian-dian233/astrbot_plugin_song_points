@@ -53,6 +53,12 @@
     "default": 45,
     "hint": "超时会把这次扣的积分自动退回"
   },
+  "stale_pending_seconds": {
+    "type": "int",
+    "description": "悬空扣分自动退回时限（秒）",
+    "default": 600,
+    "hint": "插件启动时，把超过这个秒数还卡在 pending 的订单自动退分（进程崩溃兜底）；填 0 关闭清扫"
+  },
   "refund_on_failure": {
     "type": "bool",
     "description": "播放失败自动退分",

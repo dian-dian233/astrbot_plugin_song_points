@@ -1,7 +1,7 @@
 name: astrbot_plugin_song_points
 display_name: 点歌消费积分
 desc: 点歌消耗签到积分：原子扣分 + 幂等防重 + 播放失败自动退分 + 点歌流水与消费榜
-version: v1.0.1
+version: v1.0.2
 author: dian-dian233
 repo: https://github.com/dian-dian233/astrbot_plugin_song_points
 astrbot_version: ">=4.20,<5"

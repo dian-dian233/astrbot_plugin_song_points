@@ -1,4 +1,4 @@
-"""插件层冒烟测试：用假的 astrbot 模块真跑 /点歌 全流程（不需要装 AstrBot）。
+"""插件层冒烟测试：用假的 astrbot 模块真跑 /赏歌 全流程（不需要装 AstrBot）。
 
 必测五条 + 附加：
   1 无参数 → 帮助
@@ -41,6 +41,10 @@ CREATE TABLE IF NOT EXISTS checkin_users (
 """
 
 
+REGISTERED_COMMANDS: list[dict] = []
+REGISTERED_LLM_TOOLS: list[str] = []
+
+
 def _install_astrbot_stubs() -> None:
     def _passthrough(*args, **kwargs):
         def deco(func):
@@ -48,9 +52,28 @@ def _install_astrbot_stubs() -> None:
 
         return deco
 
+    def _record_command(name, alias=None, *args, **kwargs):
+        """记录指令注册，用于断言「旧指令没注册 / 新指令只有一个 handler」。"""
+        aliases = tuple(alias or ())
+
+        def deco(func):
+            REGISTERED_COMMANDS.append(
+                {"name": name, "alias": aliases, "func": func},
+            )
+            return func
+
+        return deco
+
+    def _record_llm_tool(name=None, *args, **kwargs):
+        def deco(func):
+            REGISTERED_LLM_TOOLS.append(name)
+            return func
+
+        return deco
+
     fake_filter = types.SimpleNamespace(
-        command=_passthrough,
-        llm_tool=_passthrough,
+        command=_record_command,
+        llm_tool=_record_llm_tool,
         event_message_type=_passthrough,
         EventMessageType=types.SimpleNamespace(ALL="all"),
     )
@@ -176,6 +199,55 @@ async def _collect(agen):
     return [item async for item in agen]
 
 
+# ---------------------------------------------------------------- 指令冲突验证
+# 复刻框架侧行为，用来证明「旧指令不再注册、新指令只有一个 handler」。
+# 依据：astrbot/core/pipeline/waking_check/stage.py（剥唤醒前缀 wake_prefix）、
+#       astrbot/core/star/filter/command.py:210（message_str.startswith(full_cmd + " ") 或相等）。
+MUSIC_PLUGIN_COMMAND = "点歌"
+MUSIC_PLUGIN_KEYWORDS = ("youtube点歌", "油管点歌", "yt点歌")
+
+
+def wake_and_strip(text: str, wake_prefixes=("/",)) -> tuple[str, bool]:
+    s = (text or "").strip()
+    for prefix in wake_prefixes:
+        if s.startswith(prefix):
+            return s[len(prefix):].strip(), True
+    return s, False
+
+
+def _full_names(reg: dict) -> list[str]:
+    return [reg["name"], *reg["alias"]]
+
+
+def dispatch(text: str) -> list[dict]:
+    """复刻 CommandFilter 的匹配：命中的 handler 全部返回（用来数「有几个 handler 会跑」）。"""
+    import re
+
+    msg, woke = wake_and_strip(text)
+    if not woke:
+        return []
+    msg = re.sub(r"\s+", " ", msg.strip())
+    hits = []
+    for reg in REGISTERED_COMMANDS:
+        for full in _full_names(reg):
+            if msg == full or msg.startswith(full + " "):
+                hits.append(reg)
+    return hits
+
+
+def music_plugin_takes(text: str) -> bool:
+    """复刻 astrbot_plugin_music_youtube.on_search_song 的前置判断（cmd == 点歌 / 平台关键词）。"""
+    msg, woke = wake_and_strip(text)
+    if not woke:
+        return False
+    cmd, _, arg = msg.partition(" ")
+    if not arg:
+        return False
+    if cmd == MUSIC_PLUGIN_COMMAND:
+        return True
+    return any(kw.lower() in cmd.lower() for kw in MUSIC_PLUGIN_KEYWORDS)
+
+
 class PluginTestBase(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
@@ -232,18 +304,18 @@ class PluginTestBase(unittest.TestCase):
 class TestCommands(PluginTestBase):
     def test_no_args_shows_help(self) -> None:
         plugin = self.make_plugin()
-        items = asyncio.run(_collect(plugin.cmd_song(FakeEvent("/点歌"))))
-        self.assertTrue(any("点歌 <歌名>" in str(x) for x in items), items)
+        items = asyncio.run(_collect(plugin.cmd_song(FakeEvent("/赏歌"))))
+        self.assertTrue(any("赏歌 <歌名>" in str(x) for x in items), items)
 
     def test_empty_song_shows_help(self) -> None:
         plugin = self.make_plugin()
-        items = asyncio.run(_collect(plugin.cmd_song(FakeEvent("/点歌    "))))
-        self.assertTrue(any("点歌 <歌名>" in str(x) for x in items), items)
+        items = asyncio.run(_collect(plugin.cmd_song(FakeEvent("/赏歌    "))))
+        self.assertTrue(any("赏歌 <歌名>" in str(x) for x in items), items)
 
     def test_success_deducts_and_plays(self) -> None:
         self.grant(points=30)
         plugin = self.make_plugin()
-        items = asyncio.run(_collect(plugin.cmd_song(FakeEvent("/点歌 晴天"))))
+        items = asyncio.run(_collect(plugin.cmd_song(FakeEvent("/赏歌 晴天"))))
         joined = "\n".join(str(x) for x in items)
         self.assertIn("扣 10 分", joined)
         self.assertIn("剩余 20 分", joined)
@@ -253,7 +325,7 @@ class TestCommands(PluginTestBase):
     def test_insufficient_is_friendly(self) -> None:
         self.grant(points=3)
         plugin = self.make_plugin()
-        items = asyncio.run(_collect(plugin.cmd_song(FakeEvent("/点歌 晴天"))))
+        items = asyncio.run(_collect(plugin.cmd_song(FakeEvent("/赏歌 晴天"))))
         joined = "\n".join(str(x) for x in items)
         self.assertIn("积分不够", joined)
         self.assertIsNone(next((i for i in items if isinstance(i, Exception)), None))
@@ -263,8 +335,8 @@ class TestCommands(PluginTestBase):
     def test_duplicate_message_not_double_charged(self) -> None:
         self.grant(points=30)
         plugin = self.make_plugin()
-        first = asyncio.run(_collect(plugin.cmd_song(FakeEvent("/点歌 晴天", message_id="same"))))
-        second = asyncio.run(_collect(plugin.cmd_song(FakeEvent("/点歌 晴天", message_id="same"))))
+        first = asyncio.run(_collect(plugin.cmd_song(FakeEvent("/赏歌 晴天", message_id="same"))))
+        second = asyncio.run(_collect(plugin.cmd_song(FakeEvent("/赏歌 晴天", message_id="same"))))
         self.assertIn("扣 10 分", "\n".join(map(str, first)))
         self.assertIn("已经处理过", "\n".join(map(str, second)))
         self.assertEqual(self.points(), 20)
@@ -273,17 +345,17 @@ class TestCommands(PluginTestBase):
     def test_blocked_group(self) -> None:
         self.grant(group="66666", points=30)
         plugin = self.make_plugin(blocked_groups=["66666"])
-        items = asyncio.run(_collect(plugin.cmd_song(FakeEvent("/点歌 晴天", group="66666"))))
+        items = asyncio.run(_collect(plugin.cmd_song(FakeEvent("/赏歌 晴天", group="66666"))))
         self.assertIn("没有开通点歌", "\n".join(map(str, items)))
         self.assertEqual(self.points(group="66666"), 30)
 
     def test_allowed_groups_only(self) -> None:
         self.grant(group="77777", points=30)
         plugin = self.make_plugin(allowed_groups=["77777"])
-        blocked = asyncio.run(_collect(plugin.cmd_song(FakeEvent("/点歌 晴天", group="88888"))))
+        blocked = asyncio.run(_collect(plugin.cmd_song(FakeEvent("/赏歌 晴天", group="88888"))))
         self.assertIn("没有开通点歌", "\n".join(map(str, blocked)))
         allowed = asyncio.run(
-            _collect(plugin.cmd_song(FakeEvent("/点歌 晴天", group="77777", message_id="m2"))),
+            _collect(plugin.cmd_song(FakeEvent("/赏歌 晴天", group="77777", message_id="m2"))),
         )
         self.assertIn("扣 10 分", "\n".join(map(str, allowed)))
         self.assertEqual(self.points(group="77777"), 20)
@@ -291,7 +363,7 @@ class TestCommands(PluginTestBase):
     def test_music_tool_missing_no_charge(self) -> None:
         self.grant(points=30)
         plugin = self.make_plugin(with_tool=False)
-        items = asyncio.run(_collect(plugin.cmd_song(FakeEvent("/点歌 晴天"))))
+        items = asyncio.run(_collect(plugin.cmd_song(FakeEvent("/赏歌 晴天"))))
         self.assertIn("找不到音乐播放工具", "\n".join(map(str, items)))
         self.assertEqual(self.points(), 30)
 
@@ -299,7 +371,7 @@ class TestCommands(PluginTestBase):
         self.grant(points=30)
         plugin = self.make_plugin()
         self.fail_play = True
-        items = asyncio.run(_collect(plugin.cmd_song(FakeEvent("/点歌 晴天"))))
+        items = asyncio.run(_collect(plugin.cmd_song(FakeEvent("/赏歌 晴天"))))
         joined = "\n".join(map(str, items))
         self.assertIn("退回", joined)
         self.assertEqual(self.points(), 30)
@@ -307,25 +379,25 @@ class TestCommands(PluginTestBase):
     def test_disabled(self) -> None:
         self.grant(points=30)
         plugin = self.make_plugin(enabled=False)
-        items = asyncio.run(_collect(plugin.cmd_song(FakeEvent("/点歌 晴天"))))
+        items = asyncio.run(_collect(plugin.cmd_song(FakeEvent("/赏歌 晴天"))))
         self.assertIn("未开启", "\n".join(map(str, items)))
         self.assertEqual(self.points(), 30)
 
     def test_private_blocked_by_default(self) -> None:
         plugin = self.make_plugin()
-        items = asyncio.run(_collect(plugin.cmd_song(FakeEvent("/点歌 晴天", private=True))))
+        items = asyncio.run(_collect(plugin.cmd_song(FakeEvent("/赏歌 晴天", private=True))))
         self.assertIn("私聊", "\n".join(map(str, items)))
 
     def test_artist_split_passed_to_tool(self) -> None:
         self.grant(points=30)
         plugin = self.make_plugin()
-        asyncio.run(_collect(plugin.cmd_song(FakeEvent("/点歌 晴天 | 周杰伦"))))
+        asyncio.run(_collect(plugin.cmd_song(FakeEvent("/赏歌 晴天 | 周杰伦"))))
         self.assertEqual(self.calls, [{"song_name": "晴天", "artist": "周杰伦"}])
 
     def test_history_command(self) -> None:
         self.grant(points=30)
         plugin = self.make_plugin()
-        asyncio.run(_collect(plugin.cmd_song(FakeEvent("/点歌 晴天", message_id="h1"))))
+        asyncio.run(_collect(plugin.cmd_song(FakeEvent("/赏歌 晴天", message_id="h1"))))
         items = asyncio.run(_collect(plugin.cmd_song_history(FakeEvent("/点歌账单"))))
         joined = "\n".join(map(str, items))
         self.assertIn("点歌账单", joined)
@@ -335,7 +407,7 @@ class TestCommands(PluginTestBase):
     def test_rank_command(self) -> None:
         self.grant(points=30)
         plugin = self.make_plugin()
-        asyncio.run(_collect(plugin.cmd_song(FakeEvent("/点歌 晴天", message_id="r1"))))
+        asyncio.run(_collect(plugin.cmd_song(FakeEvent("/赏歌 晴天", message_id="r1"))))
         items = asyncio.run(_collect(plugin.cmd_song_rank(FakeEvent("/点歌榜"))))
         joined = "\n".join(map(str, items))
         self.assertIn("点歌消费榜", joined)
@@ -344,8 +416,8 @@ class TestCommands(PluginTestBase):
     def test_free_quota(self) -> None:
         self.grant(points=30)
         plugin = self.make_plugin(free_daily_quota=1)
-        first = asyncio.run(_collect(plugin.cmd_song(FakeEvent("/点歌 晴天", message_id="f1"))))
-        second = asyncio.run(_collect(plugin.cmd_song(FakeEvent("/点歌 七里香", message_id="f2"))))
+        first = asyncio.run(_collect(plugin.cmd_song(FakeEvent("/赏歌 晴天", message_id="f1"))))
+        second = asyncio.run(_collect(plugin.cmd_song(FakeEvent("/赏歌 七里香", message_id="f2"))))
         self.assertIn("今日免费点歌", "\n".join(map(str, first)))
         self.assertIn("扣 10 分", "\n".join(map(str, second)))
         self.assertEqual(self.points(), 20)
@@ -401,6 +473,90 @@ class TestLlmTools(PluginTestBase):
         items = asyncio.run(run())
         self.assertIn("扣 10 分", "\n".join(map(str, items)))
         self.assertEqual(self.points(), 20)
+
+
+class TestCommandSurface(PluginTestBase):
+    """v1.0.2：主指令改成 /赏歌，证明旧 /点歌 不再注册、新指令只有一个 handler。"""
+
+    def full_name_set(self) -> set[str]:
+        names: set[str] = set()
+        for reg in REGISTERED_COMMANDS:
+            names.update(_full_names(reg))
+        return names
+
+    def test_old_song_command_not_registered(self) -> None:
+        names = self.full_name_set()
+        for old in ("点歌", "song", "点歌台"):
+            self.assertNotIn(old, names, f"旧指令 {old} 仍在注册表里")
+        # 也不允许用「/点歌 xxx」式的新名字绕过
+        self.assertNotIn("/点歌", names)
+
+    def test_new_song_command_has_exactly_one_handler(self) -> None:
+        song_handlers = [r for r in REGISTERED_COMMANDS if r["name"] == "赏歌"]
+        self.assertEqual(len(song_handlers), 1, song_handlers)
+        self.assertEqual(set(song_handlers[0]["alias"]), {"积分点歌", "金曲"})
+
+    def test_dispatch_sing_command_hits_one_handler_and_charges_once(self) -> None:
+        self.grant(points=30)
+        plugin = self.make_plugin()
+        hits = dispatch("/赏歌 晴天")
+        self.assertEqual(len(hits), 1, [h["name"] for h in hits])
+        self.assertEqual(hits[0]["func"].__name__, "cmd_song")
+        items = asyncio.run(_collect(hits[0]["func"](plugin, FakeEvent("/赏歌 晴天"))))
+        joined = "\n".join(map(str, items))
+        self.assertIn("扣 10 分", joined)
+        self.assertEqual(self.points(), 20)
+        self.assertEqual(len(self.calls), 1, self.calls)  # 只播一次
+
+    def test_dispatch_old_command_hits_nothing_from_plugin(self) -> None:
+        for text in ("/点歌 晴天", "/song 晴天", "/点歌台 晴天", "/点歌"):
+            self.assertEqual(dispatch(text), [], text)
+
+    def test_aliases_hit_song_handler(self) -> None:
+        for text in ("/积分点歌 晴天", "/金曲 晴天"):
+            hits = dispatch(text)
+            self.assertEqual(len(hits), 1, text)
+            self.assertEqual(hits[0]["func"].__name__, "cmd_song", text)
+
+    def test_bill_and_rank_kept_with_single_handler(self) -> None:
+        self.assertIn("点歌账单", self.full_name_set())
+        self.assertIn("点歌榜", self.full_name_set())
+        bill = dispatch("/点歌账单")
+        rank = dispatch("/点歌榜 今日")
+        self.assertEqual([h["func"].__name__ for h in bill], ["cmd_song_history"])
+        self.assertEqual([h["func"].__name__ for h in rank], ["cmd_song_rank"])
+
+    def test_music_plugin_ignores_all_our_commands(self) -> None:
+        """音乐插件只看 cmd == 点歌 / 平台关键词；我们的每个名字都要让它判定「不归我」。"""
+        for name in sorted(self.full_name_set()):
+            self.assertFalse(music_plugin_takes(f"/{name} 晴天"), name)
+        # 反向确认这套判定确实能认出音乐插件的指令（否则上面的断言是空转）
+        self.assertTrue(music_plugin_takes("/点歌 晴天"))
+        self.assertTrue(music_plugin_takes("/youtube点歌 晴天"))
+
+    def test_at_mention_yields_to_music_plugin(self) -> None:
+        self.grant(points=30)
+        plugin = self.make_plugin(at_mention_enabled=True)
+        # 「@bot 点歌 X」整句让给音乐插件：不扣分、不出消息、不 stop_event
+        event = FakeEvent("点歌 晴天", chain=[FakeAt("99999")])
+        items = asyncio.run(_collect(plugin.on_at_mention(event)))
+        self.assertEqual(items, [])
+        self.assertEqual(self.points(), 30)
+        self.assertFalse(event.stopped)
+        # 老别名 song / 点歌台 谁都不认，跳过而不是把「song 晴天」当歌名
+        for legacy in ("song 晴天", "点歌台 晴天"):
+            ev = FakeEvent(legacy, chain=[FakeAt("99999")])
+            self.assertEqual(asyncio.run(_collect(plugin.on_at_mention(ev))), [], legacy)
+            self.assertEqual(self.points(), 30, legacy)
+        # 本插件自己的 @ 触发照旧可用
+        event2 = FakeEvent("赏歌 晴天", chain=[FakeAt("99999")])
+        items2 = asyncio.run(_collect(plugin.on_at_mention(event2)))
+        self.assertIn("扣 10 分", "\n".join(map(str, items2)))
+        self.assertEqual(self.points(), 20)
+
+    def test_llm_tool_names_unchanged(self) -> None:
+        self.assertIn("song_with_points", REGISTERED_LLM_TOOLS)
+        self.assertIn("song_points_balance", REGISTERED_LLM_TOOLS)
 
 
 class TestSchemaAndMetadata(unittest.TestCase):

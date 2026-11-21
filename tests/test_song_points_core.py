@@ -309,11 +309,12 @@ class TestParsing(unittest.TestCase):
             normalize_song("歌" * 81)
 
     def test_strip_command_prefix(self) -> None:
-        cmds = ("点歌", "点歌台", "song")
-        self.assertEqual(strip_command_prefix("/点歌 晴天", cmds), "晴天")
-        self.assertEqual(strip_command_prefix("点歌台晴天", cmds), "晴天")
-        self.assertEqual(strip_command_prefix("SONG 晴天", cmds), "晴天")
-        self.assertEqual(strip_command_prefix("!/点歌 晴天", cmds), "晴天")
+        cmds = ("赏歌", "积分点歌", "金曲")
+        self.assertEqual(strip_command_prefix("/赏歌 晴天", cmds), "晴天")
+        self.assertEqual(strip_command_prefix("金曲晴天", cmds), "晴天")
+        # 长名优先：不能先剥「积分点歌」里的「金曲」
+        self.assertEqual(strip_command_prefix("积分点歌 晴天", cmds), "晴天")
+        self.assertEqual(strip_command_prefix("！/赏歌 晴天", cmds), "晴天")
         self.assertEqual(strip_command_prefix("随便说点啥", cmds), "随便说点啥")
 
     def test_render_keeps_unknown_placeholder(self) -> None:

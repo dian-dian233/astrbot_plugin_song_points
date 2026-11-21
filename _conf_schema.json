@@ -3,7 +3,7 @@
     "type": "bool",
     "description": "启用点歌消费积分",
     "default": true,
-    "hint": "关掉后 /点歌 只回一句「功能未开启」，不扣分也不播放"
+    "hint": "关掉后 /赏歌 只回一句「功能未开启」，不扣分也不播放"
   },
   "cost_per_song": {
     "type": "int",

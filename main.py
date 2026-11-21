@@ -1,10 +1,12 @@
 """AstrBot 点歌消费积分插件（把签到积分当货币花）。
 
-指令：
-  /点歌 <歌名>    校验积分 → 原子扣分 → 调音乐插件真播放 → 回报扣分与余额
-  /点歌账单        查自己的点歌记录与余额
-  /点歌榜 [今日]   本群点歌消费榜
-  /点歌            不带参 → 帮助
+指令（v1.0.2 起主指令改为 /赏歌，避开音乐插件的 /点歌）：
+  /赏歌 <歌名>    校验积分 → 原子扣分 → 调音乐插件真播放 → 回报扣分与余额
+  /点歌账单        查自己的点歌记录与余额（与音乐插件不冲突，保留原名）
+  /点歌榜 [今日]   本群点歌消费榜（同上，保留原名）
+  /赏歌            不带参 → 帮助
+
+别名：/积分点歌、/金曲（均不与音乐插件的 /点歌、/song、/点歌台 重名）
 
 @机器人 + 歌名：需在配置里打开 at_mention_enabled（默认关）。
 
@@ -61,7 +63,28 @@ from song_points_core import (  # noqa: E402
 )
 
 PLUGIN_NAME = "astrbot_plugin_song_points"
-PLUGIN_VERSION = "v1.0.0"
+PLUGIN_VERSION = "v1.0.2"
+
+# v1.0.2：主指令从 /点歌 迁到 /赏歌。旧名 /点歌、/song、/点歌台 与音乐插件撞车，
+# 一律不再注册；别名同样避开这三个名字。
+SING_COMMAND = "赏歌"
+SING_ALIASES = ("积分点歌", "金曲")
+SING_TRIGGERS = (SING_COMMAND,) + SING_ALIASES
+
+# 音乐插件真正会接手的触发词（astrbot_plugin_music_youtube.on_search_song：cmd == "点歌"，
+# 或 cmd 命中平台关键词 youtube点歌/油管点歌/yt点歌）。@机器人 触发时必须整句让给它，
+# 否则「@bot 点歌 晴天」会被两边各播一遍。
+MUSIC_PLUGIN_TRIGGERS = ("点歌", "youtube点歌", "油管点歌", "yt点歌")
+# @机器人 触发时要跳过的前缀：前四个让给音乐插件；song/点歌台 谁都不认，
+# 跳过是为了不把「song 晴天」整句当成歌名去搜。
+AT_MENTION_SKIP_PREFIXES = MUSIC_PLUGIN_TRIGGERS + ("点歌台", "song")
+
+
+def _starts_with_any(text: str, prefixes: tuple[str, ...]) -> bool:
+    """text 是否以任一触发词开头（大小写不敏感，忽略前导空白）。"""
+    head = (text or "").strip().lower()
+    return any(head.startswith(p.lower()) for p in prefixes if p)
+
 
 DEFAULT_SUCCESS_TEMPLATE = "✅ 点歌成功｜{song}｜扣 {cost} 分｜剩余 {balance} 分"
 DEFAULT_FREE_TEMPLATE = "🎁 今日免费点歌｜{song}｜免费次数剩 {free_left} 次｜余额 {balance} 分"
@@ -70,11 +93,12 @@ DEFAULT_INSUFFICIENT_TEMPLATE = (
 )
 
 HELP_TEXT = (
-    "🎵 点歌（消耗签到积分）\n"
-    "· /点歌 <歌名>      花积分点一首，例如：/点歌 晴天\n"
+    "🎵 赏歌（消耗签到积分）\n"
+    "· /赏歌 <歌名>      花积分点一首，例如：/赏歌 晴天\n"
     "· /点歌账单          看自己的点歌记录 + 余额\n"
     "· /点歌榜 [今日]     看本群消费榜\n"
-    "积分来自 /签到，余额不足就去签到。"
+    "积分来自 /签到，余额不足就去签到。\n"
+    "（/点歌 是音乐插件的指令，本插件不占用）"
 )
 
 
@@ -404,7 +428,7 @@ class SongPointsPlugin(Star):
         try:
             text, extra = await self._process(event, song, artist)
         except InvalidArgument as exc:
-            yield event.plain_result(f"⚠️ {exc}\n用法：/点歌 <歌名>，例如 /点歌 晴天")
+            yield event.plain_result(f"⚠️ {exc}\n用法：/赏歌 <歌名>，例如 /赏歌 晴天")
             return
         except Exception as exc:  # noqa: BLE001
             logger.error("[song_points] 未预期异常：%s", exc)
@@ -418,14 +442,14 @@ class SongPointsPlugin(Star):
                 continue
 
     # ------------------------------------------------------------ 指令
-    @filter.command("点歌", alias={"song", "点歌台"})
+    @filter.command(SING_COMMAND, alias=set(SING_ALIASES))
     async def cmd_song(self, event: AstrMessageEvent):
-        """点歌（消耗签到积分）：/点歌 歌名"""
+        """赏歌（消耗签到积分）：/赏歌 歌名"""
         if not self._enabled():
             yield event.plain_result("点歌功能未开启（配置项 enabled）")
             return
         text = self._text(event)
-        raw = strip_command_prefix(text, ("点歌", "点歌台", "song"))
+        raw = strip_command_prefix(text, SING_TRIGGERS)
         artist = ""
         raw, artist = self._split_artist(raw)
         try:
@@ -438,7 +462,7 @@ class SongPointsPlugin(Star):
 
     @staticmethod
     def _split_artist(raw: str) -> tuple[str, str]:
-        """支持 `/点歌 晴天 | 周杰伦` 与 `/点歌 晴天 - 周杰伦` 两种写法。"""
+        """支持 `/赏歌 晴天 | 周杰伦` 与 `/赏歌 晴天 - 周杰伦` 两种写法。"""
         text = (raw or "").strip()
         for sep in ("|", "｜", " - ", " -", "- "):
             if sep in text:
@@ -511,7 +535,7 @@ class SongPointsPlugin(Star):
 
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def on_at_mention(self, event: AstrMessageEvent):
-        """@机器人 + 歌名 也能点歌（配置 at_mention_enabled 打开后生效）。"""
+        """@机器人 + 歌名 也能赏歌（配置 at_mention_enabled 打开后生效）。"""
         if not self._enabled() or not self._at_mention_enabled():
             return
         text = self._text(event)
@@ -519,7 +543,10 @@ class SongPointsPlugin(Star):
             return
         if not self._at_me(event):
             return
-        raw = strip_command_prefix(text, ("点歌", "点歌台", "song"))
+        # 音乐插件自己的触发词：整句让给它，否则「@bot 点歌 晴天」会被两边各播一次
+        if _starts_with_any(text, AT_MENTION_SKIP_PREFIXES):
+            return
+        raw = strip_command_prefix(text, SING_TRIGGERS)
         if not raw.strip():
             yield event.plain_result(HELP_TEXT)
             return

@@ -53,6 +53,60 @@
     "default": 45,
     "hint": "超时会把这次扣的积分自动退回"
   },
+  "health_check_enabled": {
+    "type": "bool",
+    "description": "点歌前预检音源",
+    "default": true,
+    "hint": "推荐开着：从音乐插件实例直接读音源列表（不联网、不放歌），没有可用音源就一分不扣，直接提示"
+  },
+  "health_check_on_startup": {
+    "type": "bool",
+    "description": "启动时预检音源并写日志",
+    "default": true,
+    "hint": "插件加载后立刻探一次，没音源会在后台日志里告警，方便管理员先发现问题"
+  },
+  "health_check_ttl": {
+    "type": "int",
+    "description": "音源预检结果缓存秒数",
+    "default": 300,
+    "hint": "默认 300 秒。管理员在音乐插件里改完音源后，最多等这么久（或发 /赏歌诊断）就生效；填 0 表示每次都重探"
+  },
+  "music_plugin_name": {
+    "type": "string",
+    "description": "音乐插件名（高级，可空）",
+    "default": "",
+    "hint": "留空即可：本插件从播放工具的 handler 直接反查所属插件实例。只有反查不到时才需要填，例如 astrbot_plugin_music"
+  },
+  "empty_result_action": {
+    "type": "string",
+    "description": "音乐工具返回空时的处理",
+    "default": "ok",
+    "hint": "ok=算成功（astrbot_plugin_music 关闭 return_play_song_result 时发送成功就返回空，别误退分）；refund=算失败退分"
+  },
+  "unknown_result_action": {
+    "type": "string",
+    "description": "音乐工具返回无法判定文本时的处理",
+    "default": "ok",
+    "hint": "ok=算成功（默认，按「没有失败证据就当成功」）；refund=算失败退分（更严格，但插件成功却回了奇怪文案时会白送）"
+  },
+  "no_source_template": {
+    "type": "text",
+    "description": "无可用音源时的提示文案",
+    "default": "🎵 音乐插件现在没有可用音源，这次不扣分。\n请管理员在音乐插件配置里至少启用一个音源（例如 netease / qqmusic / kuwo）后再点歌。",
+    "hint": "占位符：{sources} 音源清单、{detail} 探测说明"
+  },
+  "failure_template": {
+    "type": "text",
+    "description": "播放失败退分文案模板",
+    "default": "⚠️ 「{song}」没放出来，已把 {cost} 分退回｜余额 {balance} 分\n原因：{reason}",
+    "hint": "占位符：{song} {cost} {balance} {reason} {name}"
+  },
+  "diagnose_for_all": {
+    "type": "bool",
+    "description": "允许所有人发 /赏歌诊断",
+    "default": false,
+    "hint": "默认只有 AstrBot 管理员能用；打开后群里任何人都能看音源状态"
+  },
   "stale_pending_seconds": {
     "type": "int",
     "description": "悬空扣分自动退回时限（秒）",

@@ -1,10 +1,18 @@
 """AstrBot 点歌消费积分插件（把签到积分当货币花）。
 
 指令（v1.0.2 起主指令改为 /赏歌，避开音乐插件的 /点歌）：
-  /赏歌 <歌名>    校验积分 → 原子扣分 → 调音乐插件真播放 → 回报扣分与余额
+  /赏歌 <歌名>    校验积分 → 扣分 → 调音乐插件真播放 → 只认「真的放出歌」才算成功
+  /赏歌诊断       管理员音源诊断：工具是否注册、有没有可用音源、最近一次失败原因
   /点歌账单        查自己的点歌记录与余额（与音乐插件不冲突，保留原名）
   /点歌榜 [今日]   本群点歌消费榜（同上，保留原名）
   /赏歌            不带参 → 帮助
+
+v1.0.3：修「扣了分却放不出歌」
+  · 扣分前做音源预检（从音乐插件实例直接读音源列表，零副作用），
+    没有任何可用音源就一分不扣，直接告诉用户/管理员。
+  · 扣分后判定播放结果：音乐插件的失败也是 return 字符串（不抛异常），
+    所以扫失败特征串 → 退分 + 人话原因；只有明确成功（或有音频产物）才记已播放。
+  · 详见 music_health.py 头部（真实插件返回文本的取证）。
 
 别名：/积分点歌、/金曲（均不与音乐插件的 /点歌、/song、/点歌台 重名）
 
@@ -62,8 +70,17 @@ from song_points_core import (  # noqa: E402
     strip_command_prefix,
 )
 
+from music_health import (  # noqa: E402
+    SourceProbe,
+    classify_play_result,
+    extract_sources_from_instance,
+    looks_like_no_source,
+    parse_sources_from_text,
+    tool_instance,
+)
+
 PLUGIN_NAME = "astrbot_plugin_song_points"
-PLUGIN_VERSION = "v1.0.2"
+PLUGIN_VERSION = "v1.0.3"
 
 # v1.0.2：主指令从 /点歌 迁到 /赏歌。旧名 /点歌、/song、/点歌台 与音乐插件撞车，
 # 一律不再注册；别名同样避开这三个名字。
@@ -86,11 +103,17 @@ def _starts_with_any(text: str, prefixes: tuple[str, ...]) -> bool:
     return any(head.startswith(p.lower()) for p in prefixes if p)
 
 
-
 DEFAULT_SUCCESS_TEMPLATE = "✅ 点歌成功｜{song}｜扣 {cost} 分｜剩余 {balance} 分"
 DEFAULT_FREE_TEMPLATE = "🎁 今日免费点歌｜{song}｜免费次数剩 {free_left} 次｜余额 {balance} 分"
 DEFAULT_INSUFFICIENT_TEMPLATE = (
     "⚠️ 积分不够点歌｜「{song}」要 {cost} 分，你现在 {balance} 分｜先发 /签到 攒分吧"
+)
+DEFAULT_NO_SOURCE_TEMPLATE = (
+    "🎵 音乐插件现在没有可用音源，这次不扣分。\n"
+    "请管理员在音乐插件配置里至少启用一个音源（例如 netease / qqmusic / kuwo）后再点歌。"
+)
+DEFAULT_FAILURE_TEMPLATE = (
+    "⚠️ 「{song}」没放出来，已把 {cost} 分退回｜余额 {balance} 分\n原因：{reason}"
 )
 
 HELP_TEXT = (
@@ -103,6 +126,14 @@ HELP_TEXT = (
 )
 
 
+def _fill(template: str, **kwargs: object) -> str:
+    """模板占位符填充；模板写错也不让指令炸掉。"""
+    try:
+        return str(template).format(**kwargs)
+    except Exception:
+        return str(template)
+
+
 @register(PLUGIN_NAME, "dian-dian233", "点歌消耗签到积分", PLUGIN_VERSION)
 class SongPointsPlugin(Star):
     def __init__(self, context: Context, config: Any = None):
@@ -110,6 +141,8 @@ class SongPointsPlugin(Star):
         self.config = config or {}
         self._store: Optional[SongPointsStore] = None
         self._store_key = ""
+        self._probe: Optional[SourceProbe] = None
+        self._last_failure: str = ""
         self._build_store()
         logger.info(
             "[song_points] 已加载 v%s，积分库：%s",
@@ -268,6 +301,79 @@ class SongPointsPlugin(Star):
         except Exception:
             return []
 
+    # ------------------------------------------------------------ 音源预检
+    async def _probe_sources(self, tool=None, force: bool = False) -> SourceProbe:
+        """探测音乐插件「到底有没有可用音源」。
+
+        做法（零网络、零副作用）：从 LLM 工具反查它所属的插件实例，直接读音源列表。
+        依据 astrbot/core/star/star_manager.py:1299：插件工具 handler 是
+        functools.partial(raw_handler, star_cls)，args[0] 就是插件实例。
+        """
+        tool = tool if tool is not None else self._find_music_tool()
+        if tool is None:
+            return SourceProbe(
+                available=None, method="tool-missing", detail="音乐播放工具未注册"
+            )
+        tool_name = str(getattr(tool, "name", "") or "")
+        ttl = max(0, int(self._cfg("health_check_ttl", 300) or 0))
+        cached = self._probe
+        if (
+            cached is not None
+            and not force
+            and cached.tool_name == tool_name
+            and ttl > 0
+            and (time.time() - cached.ts) < ttl
+        ):
+            return cached
+
+        instance = tool_instance(tool)
+        if instance is None:
+            configured = str(self._cfg("music_plugin_name", "") or "").strip()
+            if configured:
+                try:
+                    meta = self.context.get_registered_star(configured)
+                    instance = getattr(meta, "star_cls", None) if meta else None
+                except Exception:  # 框架版本差异 / 插件没装
+                    instance = None
+        probe = await asyncio.to_thread(extract_sources_from_instance, instance)
+        probe.tool_name = tool_name
+        probe.ts = time.time()
+        self._probe = probe
+        return probe
+
+    def _no_source_text(self, probe: SourceProbe, event: AstrMessageEvent) -> str:
+        template = str(self._cfg("no_source_template", DEFAULT_NO_SOURCE_TEMPLATE))
+        text = _fill(template, sources="、".join(probe.sources) or "无", detail=probe.detail)
+        if self._is_admin(event):
+            text += f"\n\n[管理员诊断] {probe.summary()}｜探测方式：{probe.method or 'unknown'}"
+        return text
+
+    @staticmethod
+    def _human_reason(why: str, note: str) -> str:
+        """把判定结果翻成一句人话（写进回复和订单备注）。"""
+        raw = note if note else why
+        raw = " ".join(str(raw).split())
+        if looks_like_no_source(raw):
+            return f"音乐插件没有可用音源，歌没放出来（{raw[:80]}）"
+        return raw[:120] or "音乐插件没给出原因"
+
+    def _failure_text(
+        self, song: str, outcome: OrderOutcome, reason: str, refunded: bool
+    ) -> str:
+        if not refunded:
+            return (
+                f"⚠️ 「{song}」没放出来（{reason}）｜积分不退（配置 refund_on_failure=false）"
+            )
+        template = str(self._cfg("failure_template", DEFAULT_FAILURE_TEMPLATE))
+        return _fill(
+            template,
+            song=song,
+            cost=outcome.cost,
+            balance=outcome.balance + outcome.cost,
+            reason=reason,
+            name=outcome.user_name,
+        )
+
     def _music_kwargs(self, tool, song: str, artist: str = "") -> dict[str, Any]:
         """按目标工具真实声明的参数名喂参，绝不硬塞它不认识的 key。"""
         names = self._tool_param_names(tool)
@@ -349,6 +455,19 @@ class SongPointsPlugin(Star):
                 [],
             )
 
+        # 音源可用性预检：没有音源就别让普通用户当冤大头（一分不扣）
+        if backend not in ("none", "off", "disabled", "") and bool(
+            self._cfg("health_check_enabled", True)
+        ):
+            probe = await self._probe_sources()
+            if probe.available is False:
+                logger.warning(
+                    "[song_points] 音源预检未通过（%s），本次不扣分：%s",
+                    probe.method,
+                    probe.summary(),
+                )
+                return self._no_source_text(probe, event), []
+
         uid, name = self._sender_meta(event)
         dedupe = self._dedupe_key(event, scope, uid, song)
         platform = str(self._cfg("music_default_platform", "") or "").strip()
@@ -393,12 +512,14 @@ class SongPointsPlugin(Star):
         try:
             note, extra = await self._play(event, song, artist)
         except asyncio.TimeoutError:
+            self._last_failure = f"{song}：播放超时"
             await asyncio.to_thread(store.refund, outcome.order_id, "playback timeout")
             return (
                 f"⏱ 播放超时，已把 {outcome.cost} 分退回｜余额 {outcome.balance + outcome.cost} 分",
                 [],
             )
         except SongPointsError as exc:
+            self._last_failure = f"{song}：{exc}"
             await asyncio.to_thread(store.refund, outcome.order_id, f"playback failed: {exc}")
             return (
                 f"⚠️ 播放失败（{exc}），已把 {outcome.cost} 分退回｜余额 {outcome.balance + outcome.cost} 分",
@@ -406,6 +527,7 @@ class SongPointsPlugin(Star):
             )
         except Exception as exc:  # noqa: BLE001 - 第三方音乐插件什么都能抛
             logger.error("[song_points] 播放异常：%s", exc)
+            self._last_failure = f"{song}：{exc}"
             if bool(self._cfg("refund_on_failure", True)):
                 await asyncio.to_thread(store.refund, outcome.order_id, f"playback error: {exc}")
                 return (
@@ -415,7 +537,25 @@ class SongPointsPlugin(Star):
                 )
             return (f"⚠️ 播放出错了（{exc}），积分不退（配置 refund_on_failure=false）", [])
 
-        await asyncio.to_thread(store.mark_played, outcome.order_id, note)
+        # 关键：音乐工具失败也是 return 字符串（不抛异常），所以这里必须自己判成败。
+        # 依据 music_health.py 头部注释（astrbot_plugin_music v3.2.6 真实返回文本）。
+        verdict, why = classify_play_result(
+            note,
+            len(extra),
+            empty_action=str(self._cfg("empty_result_action", "ok")),
+            unknown_action=str(self._cfg("unknown_result_action", "ok")),
+        )
+        if verdict != "ok":
+            reason = self._human_reason(why, note)
+            self._last_failure = f"{song}：{reason}"
+            logger.warning("[song_points] 播放判失败（%s）：%s", song, reason)
+            if bool(self._cfg("refund_on_failure", True)):
+                await asyncio.to_thread(store.refund, outcome.order_id, f"playback failed: {reason}")
+                return self._failure_text(song, outcome, reason, True), []
+            return self._failure_text(song, outcome, reason, False), []
+
+        self._last_failure = ""
+        await asyncio.to_thread(store.mark_played, outcome.order_id, note or why)
 
         template = DEFAULT_SUCCESS_TEMPLATE
         if outcome.status == OUTCOME_FREE:
@@ -514,6 +654,38 @@ class SongPointsPlugin(Star):
         label = "本群" if not scope.startswith("private:") else "本会话"
         yield event.plain_result(format_ranking(rows, label, title))
 
+    @filter.command("赏歌诊断", alias={"音源诊断", "赏歌状态"})
+    async def cmd_song_diagnose(self, event: AstrMessageEvent):
+        """音源诊断（管理员）：看音乐工具是否注册、有没有可用音源"""
+        if not self._is_admin(event) and not bool(self._cfg("diagnose_for_all", False)):
+            yield event.plain_result(
+                "这个指令给管理员用｜普通点歌直接发 /赏歌 <歌名> 就行（没音源时不会扣分）"
+            )
+            return
+        backend = self._music_backend()
+        tool_name = str(self._cfg("music_tool_name", "play_song_by_name") or "")
+        lines = [f"🔎 赏歌诊断 {PLUGIN_VERSION}", f"· 播放后端：{backend}｜工具名：{tool_name}"]
+        tool = self._find_music_tool()
+        if backend in ("none", "off", "disabled", ""):
+            lines.append("· 音乐工具：后端为 none，不调用音乐插件（只记账）")
+        elif tool is None:
+            lines.append("· 音乐工具：未注册（点歌一律不扣分）→ 检查音乐插件是否启用")
+        else:
+            params = "、".join(self._tool_param_names(tool)) or "无参数"
+            lines.append(f"· 音乐工具：已注册｜声明参数：{params}")
+
+        probe = await self._probe_sources(tool, force=True)
+        age = int(max(0, time.time() - probe.ts)) if probe.ts else 0
+        lines.append(f"· 音源预检：{probe.summary()}")
+        lines.append(f"· 探测方式：{probe.method or 'unknown'}｜{age} 秒前｜缓存 {self._cfg('health_check_ttl', 300)} 秒")
+        extra_sources = probe.sources or parse_sources_from_text(self._last_failure)
+        if extra_sources:
+            lines.append(f"· 音源清单：{'、'.join(extra_sources)}")
+        if probe.available is False:
+            lines.append("· 现在普通用户点歌一律不扣分（直到音源恢复）→ 去音乐插件里启用音源")
+        lines.append(f"· 最近一次失败：{self._last_failure or '无'}")
+        yield event.plain_result("\n".join(lines))
+
     # ------------------------------------------------------------ @机器人 触发
     def _at_me(self, event: AstrMessageEvent) -> bool:
         try:
@@ -598,7 +770,7 @@ class SongPointsPlugin(Star):
 
     # ------------------------------------------------------------ 生命周期
     async def initialize(self):
-        """启动时把上次崩在 pending 里的订单退分（只动超过 stale_pending_seconds 的）。"""
+        """启动时：清理悬空 pending 订单 → 探测音源是否可用。"""
         try:
             seconds = int(self._cfg("stale_pending_seconds", 600) or 0)
             if seconds > 0:
@@ -607,6 +779,24 @@ class SongPointsPlugin(Star):
                     logger.info("[song_points] 启动清扫：退回 %d 笔悬空扣分", fixed)
         except Exception as exc:  # 清扫失败不影响插件加载
             logger.warning("[song_points] 启动清扫失败：%s", exc)
+
+        if not bool(self._cfg("health_check_on_startup", True)):
+            return
+        try:
+            probe = await self._probe_sources(force=True)
+        except Exception as exc:  # 探测失败也不影响加载
+            logger.warning("[song_points] 音源预检异常：%s", exc)
+            return
+        if probe.available is False:
+            logger.warning(
+                "[song_points] 音源预检未通过（%s）：现在点歌不会扣分，"
+                "请到音乐插件配置里启用至少一个音源",
+                probe.method,
+            )
+        elif probe.available is True:
+            logger.info("[song_points] 音源预检通过：%s", probe.summary())
+        else:
+            logger.info("[song_points] 音源状态未知：%s（不阻断点歌，失败会自动退分）", probe.summary())
 
     async def terminate(self):
         self._store = None

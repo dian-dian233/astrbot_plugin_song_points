@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
 import logging
 import os
@@ -43,6 +44,7 @@ CREATE TABLE IF NOT EXISTS checkin_users (
 
 REGISTERED_COMMANDS: list[dict] = []
 REGISTERED_LLM_TOOLS: list[str] = []
+_UNSET = object()
 
 
 def _install_astrbot_stubs() -> None:
@@ -559,6 +561,239 @@ class TestCommandSurface(PluginTestBase):
         self.assertIn("song_points_balance", REGISTERED_LLM_TOOLS)
 
 
+class FakeMusicPlayer:
+    """复刻 astrbot_plugin_music 的 player.platform（Platform dataclass：name/display_name）。"""
+
+    def __init__(self, name, display_name, priority=1):
+        self.platform = types.SimpleNamespace(name=name, display_name=display_name)
+        self.platform_cfg = types.SimpleNamespace(priority=priority)
+
+
+class FakeMusicPluginInstance:
+    """复刻 astrbot_plugin_music v3.2.6 的音源查询接口，并统计被探测次数。"""
+
+    def __init__(self, players=None):
+        self.players = list(players or [])
+        self.probe_count = 0
+
+    def get_players_by_priority(self):
+        self.probe_count += 1
+        return sorted(self.players, key=lambda p: p.platform_cfg.priority)
+
+    def get_player(self, name=None, word=None, default=False):
+        return self.players[0] if (default and self.players) else None
+
+
+class TestSourcePrecheckAndVerdict(PluginTestBase):
+    """v1.0.3：无音源不扣分 + 播放失败（工具 return 失败串）必退分。"""
+
+    def make_plugin_with(self, players=None, reply="正在播放：晴天", exc=None, instance=_UNSET, **cfg):  # noqa: F821
+        if players is None:
+            players = [FakeMusicPlayer("kuwo", "酷我音乐")]
+        inst = (
+            FakeMusicPluginInstance(players)
+            if instance is _UNSET
+            else instance
+        )
+
+        async def raw(music_instance, event, **kwargs):
+            self.calls.append(kwargs)
+            if exc is not None:
+                raise exc
+            return reply
+
+        tool = FakeTool("play_song_by_name", functools.partial(raw, inst))
+        context = types.SimpleNamespace()
+        manager = FakeManager({"play_song_by_name": tool})
+        context.get_llm_tool_manager = lambda: manager
+        config = {"cost_per_song": 10, "timezone": "Asia/Shanghai", **cfg}
+        plugin = plugin_main.SongPointsPlugin(context, config)
+        return plugin, inst
+
+    def run_song(self, plugin, text="/赏歌 晴天", **kw):
+        items = asyncio.run(_collect(plugin.cmd_song(FakeEvent(text, **kw))))
+        return "\n".join(str(x) for x in items)
+
+    def orders(self):
+        conn = sqlite3.connect(self.db)
+        rows = conn.execute(
+            "SELECT song, status, cost FROM song_order_log ORDER BY id"
+        ).fetchall()
+        conn.close()
+        return rows
+
+    # ---------------------------------------------------------------- 无音源
+    def test_no_source_blocks_charge(self) -> None:
+        self.grant(points=30)
+        plugin, inst = self.make_plugin_with(players=[])
+        joined = self.run_song(plugin)
+        self.assertIn("没有可用音源", joined)
+        self.assertEqual(self.points(), 30)
+        self.assertEqual(self.calls, [])       # 没调音乐工具
+        self.assertEqual(self.orders(), [])     # 没落单
+
+    def test_no_source_admin_gets_diagnosis_line(self) -> None:
+        self.grant(points=30)
+        plugin, _ = self.make_plugin_with(players=[])
+        joined = self.run_song(plugin, admin=True)
+        self.assertIn("管理员诊断", joined)
+        self.assertIn("音源不可用", joined)
+        self.assertEqual(self.points(), 30)
+
+    def test_no_source_recovers_after_enabling(self) -> None:
+        self.grant(points=30)
+        plugin, inst = self.make_plugin_with(players=[], health_check_ttl=0)
+        self.assertIn("没有可用音源", self.run_song(plugin))
+        self.assertEqual(self.points(), 30)
+        # 管理员在音乐插件里启用了一个音源
+        inst.players.append(FakeMusicPlayer("kuwo", "酷我音乐"))
+        joined = self.run_song(plugin, text="/赏歌 晴天", message_id="m2")
+        self.assertIn("扣 10 分", joined)
+        self.assertEqual(self.points(), 20)
+
+    def test_probe_result_cached_within_ttl(self) -> None:
+        self.grant(points=30)
+        plugin, inst = self.make_plugin_with()
+        self.run_song(plugin, message_id="a")
+        self.run_song(plugin, text="/赏歌 七里香", message_id="b")
+        self.assertEqual(inst.probe_count, 1, "TTL 内不该重复探测")
+
+    def test_probe_ttl_zero_reprobes(self) -> None:
+        self.grant(points=30)
+        plugin, inst = self.make_plugin_with(health_check_ttl=0)
+        self.run_song(plugin, message_id="a")
+        self.run_song(plugin, text="/赏歌 七里香", message_id="b")
+        self.assertEqual(inst.probe_count, 2)
+
+    def test_unknown_probe_does_not_block(self) -> None:
+        self.grant(points=30)
+        plugin, _ = self.make_plugin_with(instance=types.SimpleNamespace())
+        joined = self.run_song(plugin)
+        self.assertIn("扣 10 分", joined)
+        self.assertEqual(self.points(), 20)
+
+    # ------------------------------------------------------------ 播放失败退分
+    def test_platform_unavailable_refunds(self) -> None:
+        self.grant(points=30)
+        plugin, _ = self.make_plugin_with(reply="音源「netease」不可用；指定音源时不会自动回退")
+        joined = self.run_song(plugin)
+        self.assertIn("退回", joined)
+        self.assertIn("余额 30 分", joined)
+        self.assertIn("不可用", joined)
+        self.assertEqual(self.points(), 30)
+        self.assertEqual([r[1] for r in self.orders()], ["refunded"])
+
+    def test_not_found_refunds_and_tells_reason(self) -> None:
+        self.grant(points=30)
+        plugin, _ = self.make_plugin_with(
+            reply="未找到与《晴天》可靠匹配的歌曲；已尝试音源：网易云音乐、酷狗音乐"
+        )
+        joined = self.run_song(plugin)
+        self.assertIn("退回", joined)
+        self.assertIn("未找到", joined)
+        self.assertEqual(self.points(), 30)
+        self.assertEqual([r[1] for r in self.orders()], ["refunded"])
+
+    def test_send_failed_refunds(self) -> None:
+        self.grant(points=30)
+        plugin, _ = self.make_plugin_with(reply="音源「酷我音乐（kuwo）」发送《晴天》失败")
+        joined = self.run_song(plugin)
+        self.assertIn("退回", joined)
+        self.assertEqual(self.points(), 30)
+        self.assertEqual([r[1] for r in self.orders()], ["refunded"])
+
+    def test_refund_twice_is_idempotent(self) -> None:
+        self.grant(points=30)
+        plugin, _ = self.make_plugin_with(reply="无可用播放器")
+        self.run_song(plugin)
+        self.run_song(plugin, message_id="m2")
+        self.assertEqual(self.points(), 30, "退分只能退一次，不能把余额越退越多")
+        self.assertEqual([r[1] for r in self.orders()], ["refunded", "refunded"])
+
+    # ------------------------------------------------------------ 成功路径
+    def test_success_string_keeps_charge(self) -> None:
+        self.grant(points=30)
+        plugin, _ = self.make_plugin_with(reply="已通过音源「酷我音乐（kuwo）」发送《晴天 - 周杰伦》")
+        joined = self.run_song(plugin)
+        self.assertIn("扣 10 分", joined)
+        self.assertEqual(self.points(), 20)
+        self.assertEqual([r[1] for r in self.orders()], ["played"])
+
+    def test_empty_reply_kept_as_success(self) -> None:
+        """astrbot_plugin_music 关掉 return_play_song_result 时，成功也返回 None。"""
+        self.grant(points=30)
+        plugin, _ = self.make_plugin_with(reply=None)
+        joined = self.run_song(plugin)
+        self.assertIn("扣 10 分", joined)
+        self.assertEqual(self.points(), 20)
+        self.assertEqual([r[1] for r in self.orders()], ["played"])
+
+    def test_empty_reply_refund_when_configured(self) -> None:
+        self.grant(points=30)
+        plugin, _ = self.make_plugin_with(reply=None)
+        plugin.config["empty_result_action"] = "refund"
+        joined = self.run_song(plugin)
+        self.assertIn("退回", joined)
+        self.assertEqual(self.points(), 30)
+        self.assertEqual([r[1] for r in self.orders()], ["refunded"])
+
+    def test_free_quota_returned_on_failure(self) -> None:
+        self.grant(points=30)
+        plugin, _ = self.make_plugin_with(reply="无可用播放器")
+        plugin.config["free_daily_quota"] = 1
+        self.run_song(plugin)
+        balance = plugin.store.balance("88888", "10001")
+        free_left = plugin.store.free_left("88888", "10001")
+        self.assertEqual(balance, 30)
+        self.assertEqual(free_left, 1, "失败要把免费次数还回去")
+
+    # ------------------------------------------------------------ 诊断指令
+    def test_diagnose_admin_lists_sources(self) -> None:
+        plugin, _ = self.make_plugin_with()
+        items = asyncio.run(
+            _collect(plugin.cmd_song_diagnose(FakeEvent("/赏歌诊断", admin=True)))
+        )
+        joined = "\n".join(str(x) for x in items)
+        self.assertIn("音源预检", joined)
+        self.assertIn("酷我音乐", joined)
+        self.assertIn("已注册", joined)
+
+    def test_diagnose_non_admin_blocked(self) -> None:
+        plugin, _ = self.make_plugin_with()
+        items = asyncio.run(_collect(plugin.cmd_song_diagnose(FakeEvent("/赏歌诊断"))))
+        self.assertIn("管理员", "\n".join(str(x) for x in items))
+
+    def test_diagnose_reports_no_source(self) -> None:
+        plugin, _ = self.make_plugin_with(players=[], reply="无可用播放器")
+        self.run_song(plugin)
+        items = asyncio.run(
+            _collect(plugin.cmd_song_diagnose(FakeEvent("/赏歌诊断", admin=True)))
+        )
+        joined = "\n".join(str(x) for x in items)
+        self.assertIn("音源不可用", joined)
+        self.assertIn("一律不扣分", joined)
+
+    def test_diagnose_reports_last_failure(self) -> None:
+        self.grant(points=30)
+        plugin, _ = self.make_plugin_with(reply="无可用播放器")
+        self.run_song(plugin)
+        items = asyncio.run(
+            _collect(plugin.cmd_song_diagnose(FakeEvent("/赏歌诊断", admin=True)))
+        )
+        joined = "\n".join(str(x) for x in items)
+        self.assertIn("最近一次失败", joined)
+        self.assertIn("无可用播放器", joined)
+
+    def test_diagnose_has_single_handler(self) -> None:
+        handlers = [r for r in REGISTERED_COMMANDS if r["name"] == "赏歌诊断"]
+        self.assertEqual(len(handlers), 1, handlers)
+        self.assertEqual(handlers[0]["func"].__name__, "cmd_song_diagnose")
+        self.assertEqual(dispatch("/赏歌诊断")[0]["func"].__name__, "cmd_song_diagnose")
+        # 诊断指令不能被 /赏歌 抢走
+        song_hits = dispatch("/赏歌诊断")
+        self.assertEqual(len(song_hits), 1, song_hits)
+
+
 class TestSchemaAndMetadata(unittest.TestCase):
     def test_conf_schema_matches_plugin_reads(self) -> None:
         with open(os.path.join(PLUGIN_DIR, "_conf_schema.json"), encoding="utf-8") as fh:
@@ -572,6 +807,10 @@ class TestSchemaAndMetadata(unittest.TestCase):
             "history_size", "success_template", "free_template",
             "not_enough_template", "timezone", "checkin_plugin_name",
             "db_path_override",
+            # v1.0.3：音源预检 + 播放结果判定
+            "health_check_enabled", "health_check_on_startup", "health_check_ttl",
+            "music_plugin_name", "empty_result_action", "unknown_result_action",
+            "no_source_template", "failure_template", "diagnose_for_all",
         ):
             self.assertIn(key, schema)
         for key, spec in schema.items():
